@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YT Live Chat TTS</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: transparent;
+    font-family: 'Roboto', sans-serif;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    padding: 12px;
+    gap: 8px;
+  }
+
+  /* ── Panel Control (disembunyikan di OBS, tampil di browser biasa) ─────── */
+  #control-panel {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    background: #1a1a1a;
+    border-bottom: 2px solid #FF0000;
+    padding: 12px 16px;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    z-index: 999;
+    flex-wrap: wrap;
+  }
+
+  #control-panel input {
+    flex: 1;
+    min-width: 200px;
+    padding: 8px 12px;
+    background: #2a2a2a;
+    border: 1px solid #444;
+    border-radius: 6px;
+    color: #fff;
+    font-size: 14px;
+    font-family: 'Roboto', sans-serif;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  #control-panel input:focus { border-color: #FF0000; }
+  #control-panel input::placeholder { color: #666; }
+
+  #control-panel button {
+    padding: 8px 18px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: 'Roboto', sans-serif;
+    transition: all 0.15s;
+  }
+  #btn-start { background: #FF0000; color: #fff; }
+  #btn-start:hover { background: #cc0000; }
+  #btn-stop { background: #333; color: #aaa; }
+  #btn-stop:hover { background: #444; color: #fff; }
+
+  #status-text {
+    font-size: 12px;
+    color: #888;
+    width: 100%;
+    padding-left: 2px;
+  }
+  #status-text.ok { color: #4ade80; }
+  #status-text.err { color: #f87171; }
+
+  /* ── Chat Messages ─────────────────────────────────────────────────────── */
+  #chat-container {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 100vh;
+    overflow: hidden;
+    /* Beri ruang untuk control panel saat di browser biasa */
+    padding-top: 80px;
+  }
+
+  /* Mode OBS: sembunyikan control panel, chat dari bawah */
+  body.obs-mode #control-panel { display: none; }
+  body.obs-mode #chat-container { padding-top: 0; }
+
+  .chat-msg {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: rgba(0, 0, 0, 0.72);
+    border-left: 3px solid #FF0000;
+    border-radius: 0 8px 8px 0;
+    padding: 8px 12px;
+    backdrop-filter: blur(4px);
+    animation: slideIn 0.3s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    max-width: 480px;
+  }
+
+  .chat-msg.super-chat {
+    border-left-color: #FFD700;
+    background: rgba(255, 215, 0, 0.15);
+  }
+
+  .chat-msg.speaking {
+    border-left-color: #4ade80;
+    box-shadow: 0 0 12px rgba(74, 222, 128, 0.35);
+  }
+
+  .chat-msg.removing {
+    animation: slideOut 0.3s ease forwards;
+  }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(-20px) scale(0.95); }
+    to   { opacity: 1; transform: translateX(0) scale(1); }
+  }
+  @keyframes slideOut {
+    from { opacity: 1; transform: translateX(0); }
+    to   { opacity: 0; transform: translateX(-20px); }
+  }
+
+  .avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #FF0000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+    text-transform: uppercase;
+  }
+
+  .msg-body { flex: 1; min-width: 0; }
+
+  .msg-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 2px;
+  }
+
+  .username {
+    font-size: 13px;
+    font-weight: 700;
+    color: #FF6B6B;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 180px;
+  }
+
+  .super-chat .username { color: #FFD700; }
+
+  .superchat-badge {
+    font-size: 10px;
+    background: #FFD700;
+    color: #000;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
+
+  .tts-icon {
+    font-size: 10px;
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+  .speaking .tts-icon { opacity: 1; animation: pulse 0.6s ease infinite alternate; }
+
+  @keyframes pulse {
+    from { opacity: 0.4; }
+    to   { opacity: 1; }
+  }
+
+  .comment {
+    font-size: 14px;
+    color: #f0f0f0;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+
+  /* ── Queue badge ───────────────────────────────────────────────────────── */
+  #queue-badge {
+    position: fixed;
+    bottom: 12px;
+    right: 12px;
+    background: rgba(0,0,0,0.7);
+    color: #888;
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    display: none;
+  }
+  #queue-badge.visible { display: block; }
+</style>
+</head>
+<body>
+
+<!-- CONTROL PANEL (terlihat di browser, otomatis tersembunyi di OBS via URL param) -->
+<div id="control-panel">
+  <input id="video-input" type="text" placeholder="Tempel URL YouTube Live atau Video ID..." />
+  <button id="btn-start" onclick="startListening()">▶ Mulai</button>
+  <button id="btn-stop" onclick="stopListening()">⏹ Stop</button>
+  <div id="status-text">Belum terhubung. Masukkan URL / Video ID live stream.</div>
+</div>
+
+<div id="chat-container"></div>
+<div id="queue-badge"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+// ── Deteksi mode OBS via URL param ?obs=1 ──────────────────────────────────
+const params = new URLSearchParams(window.location.search);
+if (params.get('obs') === '1') {
+  document.body.classList.add('obs-mode');
+}
+
+const socket = io();
+const chatContainer = document.getElementById('chat-container');
+const statusEl = document.getElementById('status-text');
+const queueBadge = document.getElementById('queue-badge');
+
+const MAX_MESSAGES = 6; // Maks pesan tampil sekaligus
+const TTS_QUEUE = [];   // Antrian TTS
+let isSpeaking = false;
+
+// ── Socket Events ──────────────────────────────────────────────────────────
+socket.on('sys-message', (msg) => {
+  const isErr = msg.startsWith('❌') || msg.startsWith('⚠️');
+  statusEl.textContent = msg;
+  statusEl.className = isErr ? 'err' : 'ok';
+});
+
+socket.on('sys-error', (msg) => {
+  statusEl.textContent = '❌ ' + msg;
+  statusEl.className = 'err';
+});
+
+socket.on('chat', (data) => {
+  addMessage(data);
+});
+
+// ── Tambah pesan ke UI dan TTS queue ──────────────────────────────────────
+function addMessage(data) {
+  const msgEl = createMsgElement(data);
+  chatContainer.appendChild(msgEl);
+
+  // Batasi jumlah pesan tampil
+  const msgs = chatContainer.querySelectorAll('.chat-msg');
+  if (msgs.length > MAX_MESSAGES) {
+    const oldest = msgs[0];
+    oldest.classList.add('removing');
+    setTimeout(() => oldest.remove(), 300);
+  }
+
+  // Masukkan ke antrian TTS jika ada audio
+  if (data.audioData) {
+    TTS_QUEUE.push({ audioData: data.audioData, element: msgEl });
+    updateQueueBadge();
+    if (!isSpeaking) processQueue();
+  }
+}
+
+function createMsgElement(data) {
+  const div = document.createElement('div');
+  div.className = 'chat-msg' + (data.isSuperChat ? ' super-chat' : '');
+  div.dataset.msgId = Date.now() + Math.random();
+
+  const initial = (data.username || '?')[0];
+  const superBadge = data.isSuperChat
+    ? `<span class="superchat-badge">💛 ${data.amount}</span>` : '';
+
+  div.innerHTML = `
+    <div class="avatar">${initial}</div>
+    <div class="msg-body">
+      <div class="msg-header">
+        <span class="username">${escHtml(data.username)}</span>
+        ${superBadge}
+        <span class="tts-icon">🔊</span>
+      </div>
+      <div class="comment">${escHtml(data.comment)}</div>
+    </div>
+  `;
+  return div;
+}
+
+// ── TTS Queue Processor ────────────────────────────────────────────────────
+function processQueue() {
+  if (TTS_QUEUE.length === 0) {
+    isSpeaking = false;
+    updateQueueBadge();
+    return;
+  }
+
+  isSpeaking = true;
+  const { audioData, element } = TTS_QUEUE.shift();
+  updateQueueBadge();
+
+  // Tandai pesan yang sedang dibaca
+  element.classList.add('speaking');
+
+  const audio = new Audio(audioData);
+  audio.onended = () => {
+    element.classList.remove('speaking');
+    processQueue();
+  };
+  audio.onerror = () => {
+    element.classList.remove('speaking');
+    processQueue();
+  };
+  audio.play().catch(() => {
+    element.classList.remove('speaking');
+    processQueue();
+  });
+}
+
+function updateQueueBadge() {
+  const len = TTS_QUEUE.length;
+  if (len > 0) {
+    queueBadge.textContent = `🔊 Antrian: ${len}`;
+    queueBadge.classList.add('visible');
+  } else {
+    queueBadge.classList.remove('visible');
+  }
+}
+
+// ── Control Functions ──────────────────────────────────────────────────────
+function startListening() {
+  const val = document.getElementById('video-input').value.trim();
+  if (!val) {
+    statusEl.textContent = '⚠️ Masukkan URL atau Video ID terlebih dahulu.';
+    statusEl.className = 'err';
+    return;
+  }
+  statusEl.textContent = '⏳ Menghubungkan...';
+  statusEl.className = '';
+  socket.emit('set-video', val);
+}
+
+function stopListening() {
+  socket.emit('stop');
+  statusEl.textContent = 'Dihentikan.';
+  statusEl.className = '';
+}
+
+// Enter key di input
+document.getElementById('video-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') startListening();
+});
+
+// ── Util ───────────────────────────────────────────────────────────────────
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

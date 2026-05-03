@@ -1,0 +1,16 @@
+{
+    "name": "yt-tts-livechat",
+    "version": "1.0.0",
+    "description": "YouTube Live Chat TTS Reader untuk OBS — tanpa API Key",
+    "main": "index.js",
+    "scripts": {
+        "start": "node index.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "socket.io": "^4.7.2",
+        "google-tts-api": "^2.0.2",
+        "masterchat": "^1.1.0",
+        "dotenv": "^16.3.1"
+    }
+}
