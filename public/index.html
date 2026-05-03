@@ -253,6 +253,16 @@ socket.on('chat', (data) => {
   addMessage(data);
 });
 
+// Auto-connect jika ada parameter 'v' atau 'url' di URL (sangat berguna untuk OBS)
+const autoVideoId = params.get('v') || params.get('url');
+if (autoVideoId) {
+  // Tunggu sejenak sampai socket siap (opsional, tapi lebih aman)
+  setTimeout(() => {
+    socket.emit('set-video', autoVideoId);
+    statusEl.textContent = '⏳ Menghubungkan otomatis...';
+  }, 500);
+}
+
 // ── Tambah pesan ke UI dan TTS queue ──────────────────────────────────────
 function addMessage(data) {
   const msgEl = createMsgElement(data);

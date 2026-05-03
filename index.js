@@ -10,8 +10,24 @@ const server = http.createServer(app);
 const io = new Server(server);
 
 const PORT = process.env.PORT || 25522;
+const TTS_LANG = process.env.TTS_LANG || 'id';
+const TTS_MAX_LENGTH = parseInt(process.env.TTS_MAX_LENGTH) || 200;
+const CACHE_TIMEOUT = parseInt(process.env.CACHE_TIMEOUT) || 300000;
 
 app.use(express.static('public'));
+
+// ─── Endpoint & Cache untuk dukungan Lavalink Streaming ───────────────────────
+const audioCache = new Map();
+
+app.get('/audio/:id.mp3', (req, res) => {
+    const id = req.params.id;
+    const audioBuffer = audioCache.get(id);
+    if (!audioBuffer) {
+        return res.status(404).send('Audio not found or expired');
+    }
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(audioBuffer);
+});
 
 // ─── Helper: Ekstrak videoId dari URL atau input langsung ─────────────────────
 function parseVideoId(input) {
@@ -28,10 +44,14 @@ function parseVideoId(input) {
 }
 
 // ─── Shared: Proses chat → TTS → emit ke client ───────────────────────────────
-async function handleChatEvent(socket, { username, comment, isSuperChat, amount }) {
+async function handleChatEvent(socket, { username, comment, isSuperChat, amount, lang, maxLength }) {
     console.log(`[CHAT] ${isSuperChat ? '💛 SUPERCHAT ' : ''}${username}: ${comment}`);
 
     let audioBase64 = null;
+    let audioUrl = null;
+    const currentLang = lang || TTS_LANG;
+    const currentMaxLength = maxLength || TTS_MAX_LENGTH;
+
     try {
         let textToSpeak;
         if (isSuperChat && amount) {
@@ -41,9 +61,19 @@ async function handleChatEvent(socket, { username, comment, isSuperChat, amount 
         }
 
         audioBase64 = await googleTTS.getAudioBase64(
-            textToSpeak.substring(0, 200),
-            { lang: 'id', slow: false, host: 'https://translate.google.com', timeout: 10000 }
+            textToSpeak.substring(0, currentMaxLength),
+            { lang: currentLang, slow: false, host: 'https://translate.google.com', timeout: 10000 }
         );
+        
+        if (audioBase64) {
+            const audioId = Date.now() + '-' + Math.round(Math.random() * 10000);
+            audioCache.set(audioId, Buffer.from(audioBase64, 'base64'));
+            // Hapus cache sesuai timeout yang dikonfigurasi agar memori tidak penuh
+            setTimeout(() => {
+                audioCache.delete(audioId);
+            }, CACHE_TIMEOUT);
+            audioUrl = `/audio/${audioId}.mp3`;
+        }
     } catch (ttsErr) {
         console.error(`[TTS Error] ${ttsErr.message}`);
     }
@@ -54,6 +84,7 @@ async function handleChatEvent(socket, { username, comment, isSuperChat, amount 
         isSuperChat: !!isSuperChat,
         amount: amount || null,
         audioData: audioBase64 ? `data:audio/mp3;base64,${audioBase64}` : null,
+        audioUrl: audioUrl,
     });
 }
 
@@ -75,10 +106,21 @@ io.on('connection', (socket) => {
     };
 
     socket.on('set-video', async (input) => {
-        console.log(`[INFO] Input diterima: ${input}`);
+        console.log(`[INFO] Input diterima:`, input);
         stopListening();
 
-        const videoId = parseVideoId(input);
+        let videoIdRaw = input;
+        let customLang = TTS_LANG;
+        let customMaxLength = TTS_MAX_LENGTH;
+
+        // Mendukung input berupa object untuk opsi yang lebih dinamis
+        if (typeof input === 'object' && input !== null) {
+            videoIdRaw = input.videoId || input.url;
+            if (input.lang) customLang = input.lang;
+            if (input.maxLength) customMaxLength = input.maxLength;
+        }
+
+        const videoId = parseVideoId(String(videoIdRaw || ''));
         if (!videoId) {
             socket.emit('sys-message', '❌ Format URL/Video ID tidak dikenali.');
             socket.emit('sys-error', 'Video ID tidak valid.');
@@ -103,7 +145,7 @@ io.on('connection', (socket) => {
                 const username = action.authorName || 'Anonim';
                 const comment = action.message ? runsToString(action.message) : '';
                 if (!comment) return;
-                await handleChatEvent(socket, { username, comment, isSuperChat: false });
+                await handleChatEvent(socket, { username, comment, isSuperChat: false, lang: customLang, maxLength: customMaxLength });
             });
 
             // ── Super Chat ───────────────────────────────────────────────────
@@ -115,7 +157,7 @@ io.on('connection', (socket) => {
                         const amount = action.superchat?.amount
                             ? `${action.superchat.currency} ${action.superchat.amount}`
                             : null;
-                        await handleChatEvent(socket, { username, comment, isSuperChat: true, amount });
+                        await handleChatEvent(socket, { username, comment, isSuperChat: true, amount, lang: customLang, maxLength: customMaxLength });
                     }
                 }
             });
