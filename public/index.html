@@ -368,7 +368,7 @@ function createMsgElement(data) {
 
   const initial = (data.username || '?')[0].toUpperCase();
   const superBadge = data.isSuperChat
-    ? `<span class="superchat-badge">💛 ${data.amount}</span>` : '';
+    ? `<span class="superchat-badge">💛 ${escHtml(String(data.amount || ''))}</span>` : '';
 
   div.innerHTML = `
     <div class="avatar">${initial}</div>
@@ -445,6 +445,8 @@ function startListening() {
 
 function stopListening() {
   socket.emit('stop');
+  TTS_QUEUE.length = 0;
+  updateQueueBadge();
   statusEl.textContent = 'Dihentikan.';
   statusEl.className = '';
   tutorialCard.classList.remove('hidden');

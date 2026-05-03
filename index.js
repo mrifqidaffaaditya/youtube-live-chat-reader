@@ -19,8 +19,12 @@ app.use(express.static('public'));
 // ─── Endpoint & Cache untuk dukungan Lavalink Streaming ───────────────────────
 const audioCache = new Map();
 
+// FIX: Validasi format audioId untuk mencegah path traversal
 app.get('/audio/:id.mp3', (req, res) => {
     const id = req.params.id;
+    if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
+        return res.status(400).send('Invalid audio ID');
+    }
     const audioBuffer = audioCache.get(id);
     if (!audioBuffer) {
         return res.status(404).send('Audio not found or expired');
@@ -99,13 +103,22 @@ io.on('connection', (socket) => {
         if (mc) {
             const currentMc = mc;
             mc = null;
-            currentMc.removeAllListeners();
-            currentMc.stop();
+            try {
+                currentMc.removeAllListeners();
+                currentMc.stop();
+            } catch (e) {
+                // Abaikan error saat stop (misal: sudah stopped)
+            }
             console.log(`[INFO] Masterchat dihentikan untuk ${socket.id}`);
         }
     };
 
     socket.on('set-video', async (input) => {
+        // FIX: Validasi input
+        if (!input || (typeof input !== 'string' && typeof input !== 'object')) {
+            socket.emit('sys-message', '❌ Input tidak valid.');
+            return;
+        }
         console.log(`[INFO] Input diterima:`, input);
         stopListening();
 
@@ -196,6 +209,18 @@ io.on('connection', (socket) => {
         console.log(`[INFO] Client terputus: ${socket.id}`);
         stopListening();
     });
+});
+
+// --- Graceful Shutdown ---
+process.on('SIGINT', () => {
+    console.log('[Shutdown] Menutup server...');
+    io.close();
+    server.close();
+    process.exit(0);
+});
+
+process.on('unhandledRejection', (err) => {
+    console.error('[Unhandled Rejection]', err);
 });
 
 server.listen(PORT, () => {
