@@ -155,7 +155,7 @@ io.on('connection', (socket) => {
             // ── Chat biasa ───────────────────────────────────────────────────
             mc.on('chat', async (action) => {
                 if (action.type !== 'addChatItemAction') return;
-                const username = action.authorName || 'Anonim';
+                const username = (action.authorName || 'Anonim').replace(/^@/, '');
                 const comment = action.message ? runsToString(action.message) : '';
                 if (!comment) return;
                 await handleChatEvent(socket, { username, comment, isSuperChat: false, lang: customLang, maxLength: customMaxLength });
@@ -165,7 +165,7 @@ io.on('connection', (socket) => {
             mc.on('actions', async (actions) => {
                 for (const action of actions) {
                     if (action.type === 'addSuperChatItemAction') {
-                        const username = action.authorName || 'Anonim';
+                        const username = (action.authorName || 'Anonim').replace(/^@/, '');
                         const comment = action.message ? runsToString(action.message) : '';
                         const amount = action.superchat?.amount
                             ? `${action.superchat.currency} ${action.superchat.amount}`
