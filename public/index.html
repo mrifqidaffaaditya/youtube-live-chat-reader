@@ -64,6 +64,8 @@
   #btn-start:hover { background: #cc0000; }
   #btn-stop { background: #333; color: #ccc; }
   #btn-stop:hover { background: #444; color: #fff; }
+  #btn-skip { background: #1a1a1a; color: #FF0000; border: 1px solid #FF0000; }
+  #btn-skip:hover { background: rgba(255, 0, 0, 0.1); }
 
   #status-text {
     font-size: 14px;
@@ -262,6 +264,7 @@
   <input id="video-input" type="text" placeholder="Masukkan URL YouTube Live atau Video ID..." />
   <button id="btn-start" onclick="startListening()">Mulai Mendengarkan</button>
   <button id="btn-stop" onclick="stopListening()">Stop</button>
+  <button id="btn-skip" onclick="skipQueue()">Lewati Antrean</button>
   <div id="status-text">Menunggu input...</div>
 </div>
 
@@ -379,6 +382,13 @@ function createMsgElement(data) {
     </div>
   `;
   return div;
+}
+
+function skipQueue() {
+  TTS_QUEUE.length = 0; // Bersihkan array antrean
+  updateQueueBadge();
+  statusEl.textContent = 'Antrean audio dilewati.';
+  setTimeout(() => { statusEl.textContent = 'Memantau...'; }, 2000);
 }
 
 function processQueue() {
