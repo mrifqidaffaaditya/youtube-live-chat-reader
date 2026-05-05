@@ -104,6 +104,10 @@ const wss = new WebSocketServer({ noServer: true });
 
 const wsSessionMap = new Map();
 
+// ─── Auto-Connect: Shared Live Sessions ───────────────────────────────────────
+// Map: videoId → { mc: Masterchat, refCount: number, status: string }
+const liveSessionMap = new Map();
+
 // FIX: Rate limiting koneksi WS per IP
 const WS_MAX_CONNECTIONS_PER_IP = 10;
 const wsIpCount = new Map();
@@ -155,6 +159,192 @@ server.on('upgrade', (request, socket, head) => {
     }
 });
 
+/**
+ * Mulai koneksi YouTube Live untuk videoId tertentu (shared/reference-counted).
+ */
+async function startLiveSession(streamKey) {
+    if (liveSessionMap.has(streamKey)) {
+        // Sudah ada session, increment refCount
+        const session = liveSessionMap.get(streamKey);
+        session.refCount++;
+        console.log(`[WS-Auto] Reuse session untuk ${streamKey} (refCount: ${session.refCount})`);
+        return;
+    }
+
+    // Parse videoId dari streamKey
+    const videoId = parseVideoId(streamKey);
+    if (!videoId) {
+        console.warn(`[WS-Auto] Stream key tidak valid sebagai videoId: ${streamKey}`);
+        broadcastToWsClients({ type: 'status', message: `❌ Video ID tidak valid: ${streamKey}` }, streamKey);
+        return;
+    }
+
+    console.log(`[WS-Auto] Memulai koneksi YouTube Live untuk ${videoId}...`);
+
+    const session = { mc: null, refCount: 1, status: 'connecting' };
+    liveSessionMap.set(streamKey, session);
+
+    // Broadcast status ke semua WS subscriber
+    const notifySubscribers = (msg) => {
+        broadcastToWsClients({ type: 'status', message: msg, stream: streamKey }, streamKey);
+    };
+
+    notifySubscribers(`⏳ Menghubungkan ke live stream ${videoId}...`);
+
+    try {
+        const mc = new Masterchat(videoId, '', { mode: 'live' });
+        session.mc = mc;
+
+        await mc.populateMetadata();
+        const title = sanitizeString(mc.title || videoId, 200);
+        console.log(`[WS-Auto] ✅ Terhubung ke: "${title}" (${videoId})`);
+        session.status = 'connected';
+        notifySubscribers(`✅ Terhubung! Memantau: ${title}`);
+
+        mc.on('chat', async (action) => {
+            if (!liveSessionMap.has(streamKey)) return;
+            if (action.type !== 'addChatItemAction') return;
+
+            const username = sanitizeString(
+                (action.authorName || 'Anonim').replace(/^@/, ''),
+                MAX_USERNAME_LENGTH
+            );
+            const comment = action.message ? sanitizeString(runsToString(action.message), MAX_COMMENT_LENGTH) : '';
+            if (!comment) return;
+
+            console.log(`[CHAT] ${username}: ${comment}`);
+
+            let audioBase64 = null;
+            let audioUrl = null;
+
+            try {
+                const textToSpeak = `${username} berkata, ${comment}`.substring(0, TTS_MAX_LENGTH);
+                audioBase64 = await googleTTS.getAudioBase64(textToSpeak, {
+                    lang: TTS_LANG, slow: false, host: 'https://translate.google.com', timeout: 10000
+                });
+                if (audioBase64) {
+                    const audioId = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+                    audioCache.set(audioId, Buffer.from(audioBase64, 'base64'));
+                    setTimeout(() => { audioCache.delete(audioId); }, CACHE_TIMEOUT);
+                    audioUrl = `/audio/${audioId}.mp3`;
+                }
+            } catch (ttsErr) {
+                console.error('[TTS Error]', sanitizeString(ttsErr.message, 200));
+            }
+
+            const chatPayload = {
+                type: 'chat',
+                platform: 'youtube',
+                stream: streamKey,
+                username,
+                comment,
+                isSuperChat: false,
+                amount: null,
+                audioUrl,
+            };
+
+            broadcastToWsClients(chatPayload, streamKey);
+        });
+
+        mc.on('actions', async (actions) => {
+            if (!liveSessionMap.has(streamKey)) return;
+            for (const action of actions) {
+                if (action.type === 'addSuperChatItemAction') {
+                    const username = sanitizeString(
+                        (action.authorName || 'Anonim').replace(/^@/, ''),
+                        MAX_USERNAME_LENGTH
+                    );
+                    const comment = action.message ? sanitizeString(runsToString(action.message), MAX_COMMENT_LENGTH) : '';
+                    const amount = action.superchat?.amount
+                        ? sanitizeString(`${action.superchat.currency} ${action.superchat.amount}`, 50)
+                        : null;
+
+                    console.log(`[CHAT] 💛 SUPERCHAT ${username}: ${comment}`);
+
+                    let audioBase64 = null;
+                    let audioUrl = null;
+
+                    try {
+                        let textToSpeak;
+                        if (amount) {
+                            textToSpeak = `Super Chat dari ${username}, ${amount}${comment ? `, berkata, ${comment}` : ''}`;
+                        } else {
+                            textToSpeak = `${username} berkata, ${comment}`;
+                        }
+                        audioBase64 = await googleTTS.getAudioBase64(
+                            textToSpeak.substring(0, TTS_MAX_LENGTH),
+                            { lang: TTS_LANG, slow: false, host: 'https://translate.google.com', timeout: 10000 }
+                        );
+                        if (audioBase64) {
+                            const audioId = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+                            audioCache.set(audioId, Buffer.from(audioBase64, 'base64'));
+                            setTimeout(() => { audioCache.delete(audioId); }, CACHE_TIMEOUT);
+                            audioUrl = `/audio/${audioId}.mp3`;
+                        }
+                    } catch (ttsErr) {
+                        console.error('[TTS Error]', sanitizeString(ttsErr.message, 200));
+                    }
+
+                    const chatPayload = {
+                        type: 'chat',
+                        platform: 'youtube',
+                        stream: streamKey,
+                        username,
+                        comment,
+                        isSuperChat: true,
+                        amount,
+                        audioUrl,
+                    };
+
+                    broadcastToWsClients(chatPayload, streamKey);
+                }
+            }
+        });
+
+        mc.on('end', (reason) => {
+            const safeReason = reason ? sanitizeString(String(reason), 100) : '';
+            console.log(`[WS-Auto] Live berakhir: ${safeReason}`);
+            notifySubscribers(`⚠️ Live berakhir${safeReason ? ': ' + safeReason : '.'}`);
+            // Cleanup
+            try { mc.removeAllListeners(); mc.stop(); } catch (e) {}
+            liveSessionMap.delete(streamKey);
+        });
+
+        mc.on('error', (err) => {
+            const safeMsg = sanitizeString(err.message, 200);
+            console.error(`[WS-Auto] Masterchat Error:`, safeMsg);
+            notifySubscribers(`❌ Error: ${safeMsg}`);
+        });
+
+        mc.listen();
+
+    } catch (err) {
+        const safeMsg = sanitizeString(err.message, 200);
+        console.error(`[WS-Auto] ❌ Gagal connect ke ${streamKey}:`, safeMsg);
+        notifySubscribers(`❌ Gagal: ${safeMsg}`);
+        liveSessionMap.delete(streamKey);
+    }
+}
+
+/**
+ * Hentikan koneksi YouTube Live jika refCount mencapai 0.
+ */
+function stopLiveSessionIfEmpty(streamKey) {
+    const session = liveSessionMap.get(streamKey);
+    if (!session) return;
+
+    session.refCount--;
+    console.log(`[WS-Auto] refCount ${streamKey}: ${session.refCount}`);
+
+    if (session.refCount <= 0) {
+        console.log(`[WS-Auto] Semua client disconnect, menghentikan ${streamKey}`);
+        if (session.mc) {
+            try { session.mc.removeAllListeners(); session.mc.stop(); } catch (e) {}
+        }
+        liveSessionMap.delete(streamKey);
+    }
+}
+
 wss.on('connection', (ws) => {
     const streamKey = ws._streamKey;
     const ip = ws._ip || 'unknown';
@@ -172,12 +362,35 @@ wss.on('connection', (ws) => {
         // Abaikan
     }
 
+    // ─── Auto-Connect: Langsung mulai koneksi YouTube Live ────────────────────
+    if (streamKey !== '*') {
+        startLiveSession(streamKey);
+    }
+
+    // ─── Handle pesan dari WS client ──────────────────────────────────────────
+    ws.on('message', (rawMsg) => {
+        try {
+            const msg = JSON.parse(rawMsg.toString());
+            if (msg.action === 'stop' && streamKey !== '*') {
+                console.log(`[WS] Client ${ip} mengirim stop untuk ${streamKey}`);
+                stopLiveSessionIfEmpty(streamKey);
+            }
+        } catch (e) {
+            // Abaikan pesan non-JSON
+        }
+    });
+
     ws.on('close', () => {
         console.log(`[WS] Client terputus: ${ip} (stream: ${streamKey})`);
         removeWsClient(ws, streamKey);
         const count = wsIpCount.get(ip) || 1;
         if (count <= 1) wsIpCount.delete(ip);
         else wsIpCount.set(ip, count - 1);
+
+        // Auto-cleanup: hentikan live jika tidak ada subscriber lagi
+        if (streamKey !== '*') {
+            stopLiveSessionIfEmpty(streamKey);
+        }
     });
 
     ws.on('error', (err) => {
@@ -186,6 +399,11 @@ wss.on('connection', (ws) => {
         const count = wsIpCount.get(ip) || 1;
         if (count <= 1) wsIpCount.delete(ip);
         else wsIpCount.set(ip, count - 1);
+
+        // Auto-cleanup
+        if (streamKey !== '*') {
+            stopLiveSessionIfEmpty(streamKey);
+        }
     });
 });
 
