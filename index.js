@@ -13,6 +13,7 @@ const io = new Server(server);
 
 // ─── Konstanta & Validasi Config ──────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT) || 25522;
+const DEBUG_MODE = process.env.DEBUG ? process.env.DEBUG.toLowerCase() : '';
 
 // FIX: Validasi TTS_LANG — hanya izinkan kode bahasa yang valid (2-5 karakter alfanumerik dan dash)
 const _rawLang = process.env.TTS_LANG || 'id';
@@ -127,6 +128,57 @@ function removeWsClient(ws, streamKey) {
     }
 }
 
+// ─── Logger Helpers ───────────────────────────────────────────────────────────
+function getWsClientCount(streamKey) {
+    if (streamKey === '*') {
+        const allClients = wsSessionMap.get('*');
+        return allClients ? allClients.size : 0;
+    }
+    const clients = wsSessionMap.get(streamKey);
+    return clients ? clients.size : 0;
+}
+
+function getTotalWsClientCount() {
+    let total = 0;
+    for (const clients of wsSessionMap.values()) {
+        total += clients.size;
+    }
+    return total;
+}
+
+function logWsConnection(action, ip, streamKey) {
+    if (DEBUG_MODE === 'all' || DEBUG_MODE === 'connection') {
+        const streamCount = getWsClientCount(streamKey);
+        const totalCount = getTotalWsClientCount();
+        console.log(`[DEBUG-CONN] ${action} | IP: ${ip} | Stream: ${streamKey} | Stream Clients: ${streamCount} | Total WS Clients: ${totalCount}`);
+    } else {
+        if (action === 'CONNECTED') console.log(`[WS] Client terhubung: ${ip} (stream: ${streamKey})`);
+        else if (action === 'DISCONNECTED') console.log(`[WS] Client terputus: ${ip} (stream: ${streamKey})`);
+    }
+}
+
+function logIoConnection(action, socketId, targetVideoId = null) {
+    if (DEBUG_MODE === 'all' || DEBUG_MODE === 'connection') {
+        const totalCount = io.engine.clientsCount;
+        const streamInfo = targetVideoId ? ` | VideoID: ${targetVideoId}` : '';
+        console.log(`[DEBUG-CONN] Socket.IO ${action} | ID: ${socketId}${streamInfo} | Total IO Clients: ${totalCount}`);
+    } else {
+        if (action === 'CONNECTED') console.log(`[INFO] Client terhubung: ${socketId}`);
+        else if (action === 'DISCONNECTED') console.log(`[INFO] Client terputus: ${socketId}`);
+    }
+}
+
+function logChatInfo(platform, streamKey, username, comment, isSuperChat = false, amount = null) {
+    if (DEBUG_MODE === 'all') {
+        const streamCount = getWsClientCount(streamKey);
+        const superChatInfo = isSuperChat ? `[SUPERCHAT ${amount}] ` : '';
+        console.log(`[DEBUG-CHAT] [${platform.toUpperCase()} - ${streamKey}] | WS Clients: ${streamCount} | ${superChatInfo}${username}: ${comment}`);
+    } else {
+        const superChatInfo = isSuperChat ? `💛 SUPERCHAT ` : '';
+        console.log(`[CHAT] ${superChatInfo}${username}: ${comment}`);
+    }
+}
+
 // FIX: Gunakan 'http://localhost' sebagai base — cegah Host header injection
 server.on('upgrade', (request, socket, head) => {
     let pathname, streamParam;
@@ -212,7 +264,7 @@ async function startLiveSession(streamKey) {
             const comment = action.message ? sanitizeString(runsToString(action.message), MAX_COMMENT_LENGTH) : '';
             if (!comment) return;
 
-            console.log(`[CHAT] ${username}: ${comment}`);
+            logChatInfo('youtube', streamKey, username, comment);
 
             let audioBase64 = null;
             let audioUrl = null;
@@ -259,7 +311,7 @@ async function startLiveSession(streamKey) {
                         ? sanitizeString(`${action.superchat.currency} ${action.superchat.amount}`, 50)
                         : null;
 
-                    console.log(`[CHAT] 💛 SUPERCHAT ${username}: ${comment}`);
+                    logChatInfo('youtube', streamKey, username, comment, true, amount);
 
                     let audioBase64 = null;
                     let audioUrl = null;
@@ -348,8 +400,8 @@ function stopLiveSessionIfEmpty(streamKey) {
 wss.on('connection', (ws) => {
     const streamKey = ws._streamKey;
     const ip = ws._ip || 'unknown';
-    console.log(`[WS] Client terhubung: ${ip} (stream: ${streamKey})`);
     addWsClient(ws, streamKey);
+    logWsConnection('CONNECTED', ip, streamKey);
 
     // FIX: try/catch pada ws.send() awal
     try {
@@ -381,8 +433,8 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => {
-        console.log(`[WS] Client terputus: ${ip} (stream: ${streamKey})`);
         removeWsClient(ws, streamKey);
+        logWsConnection('DISCONNECTED', ip, streamKey);
         const count = wsIpCount.get(ip) || 1;
         if (count <= 1) wsIpCount.delete(ip);
         else wsIpCount.set(ip, count - 1);
@@ -463,7 +515,7 @@ async function handleChatEvent(socket, { username, comment, isSuperChat, amount,
 
     if (!safeComment) return; // Jangan proses komentar kosong
 
-    console.log(`[CHAT] ${isSuperChat ? '💛 SUPERCHAT ' : ''}${safeUsername}: ${safeComment}`);
+    logChatInfo('youtube', videoId || 'unknown', safeUsername, safeComment, isSuperChat, safeAmount);
 
     let audioBase64 = null;
     let audioUrl = null;
@@ -520,7 +572,7 @@ async function handleChatEvent(socket, { username, comment, isSuperChat, amount,
 
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
-    console.log(`[INFO] Client terhubung: ${socket.id}`);
+    logIoConnection('CONNECTED', socket.id);
 
     /** @type {import('masterchat').Masterchat | null} */
     let mc = null;
@@ -636,7 +688,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        console.log(`[INFO] Client terputus: ${socket.id}`);
+        logIoConnection('DISCONNECTED', socket.id);
         stopListening();
     });
 });
