@@ -103,6 +103,33 @@ function validateMaxLength(val) {
 // Path dengan filter sesi: ws://localhost:<PORT>/ws/chat?stream=<videoId>
 const wss = new WebSocketServer({ noServer: true });
 
+// Map sesi: streamKey → Set<ws>
+// Key '*' digunakan untuk client yang ingin menerima SEMUA stream
+const wsSessionMap = new Map();
+
+// ─── Auto-Connect: Shared Live Sessions ───────────────────────────────────────
+// Map: streamKey → { mc: Masterchat, status: string }
+const liveSessionMap = new Map();
+
+// FIX: Rate limiting koneksi WS per IP — cegah flood
+const WS_MAX_CONNECTIONS_PER_IP = 10;
+const wsIpCount = new Map();
+
+function addWsClient(ws, streamKey) {
+    if (!wsSessionMap.has(streamKey)) {
+        wsSessionMap.set(streamKey, new Set());
+    }
+    wsSessionMap.get(streamKey).add(ws);
+}
+
+function removeWsClient(ws, streamKey) {
+    const set = wsSessionMap.get(streamKey);
+    if (set) {
+        set.delete(ws);
+        if (set.size === 0) wsSessionMap.delete(streamKey);
+    }
+}
+
 const ioSessionMap = new Map();
 
 function addIoClient(socket, streamKey, lang = TTS_LANG, maxLength = TTS_MAX_LENGTH) {
@@ -263,9 +290,9 @@ async function startLiveSession(streamKey) {
 
             let audioBase64 = null;
             let audioUrl = null;
+            const textToSpeak = `${username} berkata, ${comment}`.substring(0, TTS_MAX_LENGTH);
 
             try {
-                const textToSpeak = `${username} berkata, ${comment}`.substring(0, TTS_MAX_LENGTH);
                 audioBase64 = await googleTTS.getAudioBase64(textToSpeak, {
                     lang: TTS_LANG, slow: false, host: 'https://translate.google.com', timeout: 10000
                 });
@@ -346,14 +373,14 @@ async function startLiveSession(streamKey) {
 
                     let audioBase64 = null;
                     let audioUrl = null;
+                    let textToSpeak;
+                    if (amount) {
+                        textToSpeak = `Super Chat dari ${username}, ${amount}${comment ? `, berkata, ${comment}` : ''}`;
+                    } else {
+                        textToSpeak = `${username} berkata, ${comment}`;
+                    }
 
                     try {
-                        let textToSpeak;
-                        if (amount) {
-                            textToSpeak = `Super Chat dari ${username}, ${amount}${comment ? `, berkata, ${comment}` : ''}`;
-                        } else {
-                            textToSpeak = `${username} berkata, ${comment}`;
-                        }
                         audioBase64 = await googleTTS.getAudioBase64(
                             textToSpeak.substring(0, TTS_MAX_LENGTH),
                             { lang: TTS_LANG, slow: false, host: 'https://translate.google.com', timeout: 10000 }
