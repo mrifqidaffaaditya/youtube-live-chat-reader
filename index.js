@@ -103,68 +103,57 @@ function validateMaxLength(val) {
 // Path dengan filter sesi: ws://localhost:<PORT>/ws/chat?stream=<videoId>
 const wss = new WebSocketServer({ noServer: true });
 
-const wsSessionMap = new Map();
+const ioSessionMap = new Map();
 
-// ─── Auto-Connect: Shared Live Sessions ───────────────────────────────────────
-// Map: videoId → { mc: Masterchat, refCount: number, status: string }
-const liveSessionMap = new Map();
-
-// FIX: Rate limiting koneksi WS per IP
-const WS_MAX_CONNECTIONS_PER_IP = 10;
-const wsIpCount = new Map();
-
-function addWsClient(ws, streamKey) {
-    if (!wsSessionMap.has(streamKey)) {
-        wsSessionMap.set(streamKey, new Set());
-    }
-    wsSessionMap.get(streamKey).add(ws);
+function addIoClient(socket, streamKey, lang = TTS_LANG, maxLength = TTS_MAX_LENGTH) {
+    if (!ioSessionMap.has(streamKey)) ioSessionMap.set(streamKey, new Map());
+    ioSessionMap.get(streamKey).set(socket, { lang, maxLength });
 }
 
-function removeWsClient(ws, streamKey) {
-    const set = wsSessionMap.get(streamKey);
-    if (set) {
-        set.delete(ws);
-        if (set.size === 0) wsSessionMap.delete(streamKey);
+function removeIoClient(socket, streamKey) {
+    const clients = ioSessionMap.get(streamKey);
+    if (clients) {
+        clients.delete(socket);
+        if (clients.size === 0) ioSessionMap.delete(streamKey);
     }
 }
 
 // ─── Logger Helpers ───────────────────────────────────────────────────────────
 function getWsClientCount(streamKey) {
-    if (streamKey === '*') {
-        const allClients = wsSessionMap.get('*');
-        return allClients ? allClients.size : 0;
-    }
-    const clients = wsSessionMap.get(streamKey);
-    return clients ? clients.size : 0;
+    const allWs = wsSessionMap.get('*') ? wsSessionMap.get('*').size : 0;
+    const specificWs = wsSessionMap.get(streamKey) ? wsSessionMap.get(streamKey).size : 0;
+    const ioClients = ioSessionMap.get(streamKey) ? ioSessionMap.get(streamKey).size : 0;
+    return allWs + specificWs + ioClients;
 }
 
 function getTotalWsClientCount() {
     let total = 0;
-    for (const clients of wsSessionMap.values()) {
-        total += clients.size;
-    }
+    for (const clients of wsSessionMap.values()) total += clients.size;
+    for (const clients of ioSessionMap.values()) total += clients.size;
     return total;
 }
 
 function logWsConnection(action, ip, streamKey) {
+    const time = new Date().toISOString();
     if (DEBUG_MODE === 'all' || DEBUG_MODE === 'connection') {
         const streamCount = getWsClientCount(streamKey);
         const totalCount = getTotalWsClientCount();
-        console.log(`[DEBUG-CONN] ${action} | IP: ${ip} | Stream: ${streamKey} | Stream Clients: ${streamCount} | Total WS Clients: ${totalCount}`);
+        console.log(`[${time}] [DEBUG-CONN] ${action} | IP: ${ip} | Stream: ${streamKey} | Stream Clients: ${streamCount} | Total Clients: ${totalCount}`);
     } else {
-        if (action === 'CONNECTED') console.log(`[WS] Client terhubung: ${ip} (stream: ${streamKey})`);
-        else if (action === 'DISCONNECTED') console.log(`[WS] Client terputus: ${ip} (stream: ${streamKey})`);
+        if (action === 'CONNECTED') console.log(`[${time}] [WS] Client terhubung: ${ip} (stream: ${streamKey})`);
+        else if (action === 'DISCONNECTED') console.log(`[${time}] [WS] Client terputus: ${ip} (stream: ${streamKey})`);
     }
 }
 
 function logIoConnection(action, socketId, targetVideoId = null) {
+    const time = new Date().toISOString();
     if (DEBUG_MODE === 'all' || DEBUG_MODE === 'connection') {
         const totalCount = io.engine.clientsCount;
         const streamInfo = targetVideoId ? ` | VideoID: ${targetVideoId}` : '';
-        console.log(`[DEBUG-CONN] Socket.IO ${action} | ID: ${socketId}${streamInfo} | Total IO Clients: ${totalCount}`);
+        console.log(`[${time}] [DEBUG-CONN] Socket.IO ${action} | ID: ${socketId}${streamInfo} | Total IO Clients: ${totalCount}`);
     } else {
-        if (action === 'CONNECTED') console.log(`[INFO] Client terhubung: ${socketId}`);
-        else if (action === 'DISCONNECTED') console.log(`[INFO] Client terputus: ${socketId}`);
+        if (action === 'CONNECTED') console.log(`[${time}] [INFO] Client terhubung: ${socketId}`);
+        else if (action === 'DISCONNECTED') console.log(`[${time}] [INFO] Client terputus: ${socketId}`);
     }
 }
 
@@ -219,10 +208,7 @@ server.on('upgrade', (request, socket, head) => {
  */
 async function startLiveSession(streamKey) {
     if (liveSessionMap.has(streamKey)) {
-        // Sudah ada session, increment refCount
-        const session = liveSessionMap.get(streamKey);
-        session.refCount++;
-        console.log(`[WS-Auto] Reuse session untuk ${streamKey} (refCount: ${session.refCount})`);
+        console.log(`[WS-Auto] Reuse session untuk ${streamKey}`);
         return;
     }
 
@@ -236,12 +222,18 @@ async function startLiveSession(streamKey) {
 
     console.log(`[WS-Auto] Memulai koneksi YouTube Live untuk ${videoId}...`);
 
-    const session = { mc: null, refCount: 1, status: 'connecting' };
+    const session = { mc: null, status: 'connecting' };
     liveSessionMap.set(streamKey, session);
 
-    // Broadcast status ke semua WS subscriber
+    // Broadcast status ke semua WS & IO subscriber
     const notifySubscribers = (msg) => {
         broadcastToWsClients({ type: 'status', message: msg, stream: streamKey }, streamKey);
+        const ioClients = ioSessionMap.get(streamKey);
+        if (ioClients) {
+            for (const socket of ioClients.keys()) {
+                socket.emit('sys-message', msg);
+            }
+        }
     };
 
     notifySubscribers(`⏳ Menghubungkan ke live stream ${videoId}...`);
@@ -299,6 +291,42 @@ async function startLiveSession(streamKey) {
             };
 
             broadcastToWsClients(chatPayload, streamKey);
+
+            const ioClients = ioSessionMap.get(streamKey);
+            if (ioClients) {
+                for (const [socket, prefs] of ioClients.entries()) {
+                    let finalAudioBase64 = audioBase64;
+                    let finalAudioUrl = audioUrl;
+
+                    if (prefs.lang !== TTS_LANG || prefs.maxLength !== TTS_MAX_LENGTH) {
+                        try {
+                            const customTextToSpeak = textToSpeak.substring(0, prefs.maxLength);
+                            finalAudioBase64 = await googleTTS.getAudioBase64(
+                                customTextToSpeak,
+                                { lang: prefs.lang, slow: false, host: 'https://translate.google.com', timeout: 10000 }
+                            );
+                            if (finalAudioBase64) {
+                                const audioId = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+                                audioCache.set(audioId, Buffer.from(finalAudioBase64, 'base64'));
+                                setTimeout(() => { audioCache.delete(audioId); }, CACHE_TIMEOUT);
+                                finalAudioUrl = `/audio/${audioId}.mp3`;
+                            }
+                        } catch (e) {
+                            console.error('[TTS Error Custom]', sanitizeString(e.message, 200));
+                        }
+                    }
+
+                    const ioPayload = {
+                        username,
+                        comment,
+                        isSuperChat: false,
+                        amount: null,
+                        audioData: finalAudioBase64 ? `data:audio/mp3;base64,${finalAudioBase64}` : null,
+                        audioUrl: finalAudioUrl,
+                    };
+                    socket.emit('chat', ioPayload);
+                }
+            }
         });
 
         mc.on('actions', async (actions) => {
@@ -352,6 +380,42 @@ async function startLiveSession(streamKey) {
                     };
 
                     broadcastToWsClients(chatPayload, streamKey);
+
+                    const ioClients = ioSessionMap.get(streamKey);
+                    if (ioClients) {
+                        for (const [socket, prefs] of ioClients.entries()) {
+                            let finalAudioBase64 = audioBase64;
+                            let finalAudioUrl = audioUrl;
+
+                            if (prefs.lang !== TTS_LANG || prefs.maxLength !== TTS_MAX_LENGTH) {
+                                try {
+                                    const customTextToSpeak = textToSpeak.substring(0, prefs.maxLength);
+                                    finalAudioBase64 = await googleTTS.getAudioBase64(
+                                        customTextToSpeak,
+                                        { lang: prefs.lang, slow: false, host: 'https://translate.google.com', timeout: 10000 }
+                                    );
+                                    if (finalAudioBase64) {
+                                        const audioId = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+                                        audioCache.set(audioId, Buffer.from(finalAudioBase64, 'base64'));
+                                        setTimeout(() => { audioCache.delete(audioId); }, CACHE_TIMEOUT);
+                                        finalAudioUrl = `/audio/${audioId}.mp3`;
+                                    }
+                                } catch (e) {
+                                    console.error('[TTS Error Custom]', sanitizeString(e.message, 200));
+                                }
+                            }
+
+                            const ioPayload = {
+                                username,
+                                comment,
+                                isSuperChat: true,
+                                amount,
+                                audioData: finalAudioBase64 ? `data:audio/mp3;base64,${finalAudioBase64}` : null,
+                                audioUrl: finalAudioUrl,
+                            };
+                            socket.emit('chat', ioPayload);
+                        }
+                    }
                 }
             }
         });
@@ -369,6 +433,15 @@ async function startLiveSession(streamKey) {
             const safeMsg = sanitizeString(err.message, 200);
             console.error(`[WS-Auto] Masterchat Error:`, safeMsg);
             notifySubscribers(`❌ Error: ${safeMsg}`);
+            
+            const ioClients = ioSessionMap.get(streamKey);
+            if (ioClients) {
+                for (const socket of ioClients.keys()) {
+                    socket.emit('sys-error', safeMsg);
+                }
+            }
+            try { mc.removeAllListeners(); mc.stop(); } catch (e) {}
+            liveSessionMap.delete(streamKey);
         });
 
         mc.listen();
@@ -377,21 +450,32 @@ async function startLiveSession(streamKey) {
         const safeMsg = sanitizeString(err.message, 200);
         console.error(`[WS-Auto] ❌ Gagal connect ke ${streamKey}:`, safeMsg);
         notifySubscribers(`❌ Gagal: ${safeMsg}`);
+        
+        const ioClients = ioSessionMap.get(streamKey);
+        if (ioClients) {
+            for (const socket of ioClients.keys()) {
+                socket.emit('sys-error', safeMsg);
+            }
+        }
         liveSessionMap.delete(streamKey);
     }
 }
 
 /**
- * Hentikan koneksi YouTube Live jika refCount mencapai 0.
+ * Hentikan koneksi YouTube Live jika tidak ada client lagi.
  */
 function stopLiveSessionIfEmpty(streamKey) {
     const session = liveSessionMap.get(streamKey);
     if (!session) return;
 
-    session.refCount--;
-    console.log(`[WS-Auto] refCount ${streamKey}: ${session.refCount}`);
+    // Hitung jumlah client aktif secara dinamis (WS specific + IO specific)
+    const specificWsCount = wsSessionMap.get(streamKey) ? wsSessionMap.get(streamKey).size : 0;
+    const specificIoCount = ioSessionMap.get(streamKey) ? ioSessionMap.get(streamKey).size : 0;
+    const activeSubscribers = specificWsCount + specificIoCount;
 
-    if (session.refCount <= 0) {
+    console.log(`[WS-Auto] Active subscribers for ${streamKey}: ${activeSubscribers}`);
+
+    if (activeSubscribers <= 0) {
         console.log(`[WS-Auto] Semua client disconnect, menghentikan ${streamKey}`);
         if (session.mc) {
             try { session.mc.removeAllListeners(); session.mc.stop(); } catch (e) {}
@@ -506,101 +590,17 @@ function parseVideoId(input) {
     return null;
 }
 
-// ─── Shared: Proses chat → TTS → emit ke client ───────────────────────────────
-async function handleChatEvent(socket, { username, comment, isSuperChat, amount, lang, maxLength, videoId }) {
-    // FIX: Sanitasi semua input sebelum diproses
-    const safeUsername = sanitizeString(username, MAX_USERNAME_LENGTH);
-    const safeComment = sanitizeString(comment, MAX_COMMENT_LENGTH);
-    const safeAmount = amount ? sanitizeString(String(amount), 50) : null;
-    // FIX: Validasi lang dan maxLength — cegah inject ke Google TTS
-    const currentLang = validateLang(lang);
-    const currentMaxLength = validateMaxLength(maxLength);
-
-    if (!safeComment) return; // Jangan proses komentar kosong
-
-    logChatInfo('youtube', videoId || 'unknown', safeUsername, safeComment, isSuperChat, safeAmount);
-
-    let audioBase64 = null;
-    let audioUrl = null;
-
-    try {
-        let textToSpeak;
-        if (isSuperChat && safeAmount) {
-            textToSpeak = `Super Chat dari ${safeUsername}, ${safeAmount}${safeComment ? `, berkata, ${safeComment}` : ''}`;
-        } else {
-            textToSpeak = `${safeUsername} berkata, ${safeComment}`;
-        }
-
-        audioBase64 = await googleTTS.getAudioBase64(
-            textToSpeak.substring(0, currentMaxLength),
-            { lang: currentLang, slow: false, host: 'https://translate.google.com', timeout: 10000 }
-        );
-
-        if (audioBase64) {
-            // FIX: Gunakan crypto.randomBytes() untuk ID yang lebih kuat
-            const audioId = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
-            audioCache.set(audioId, Buffer.from(audioBase64, 'base64'));
-            setTimeout(() => { audioCache.delete(audioId); }, CACHE_TIMEOUT);
-            audioUrl = `/audio/${audioId}.mp3`;
-        }
-    } catch (ttsErr) {
-        console.error(`[TTS Error] ${sanitizeString(ttsErr.message, 200)}`);
-    }
-
-    // FIX: Payload hanya berisi data yang sudah disanitasi
-    const chatPayload = {
-        type: 'chat',
-        platform: 'youtube',
-        stream: videoId || null,
-        username: safeUsername,
-        comment: safeComment,
-        isSuperChat: !!isSuperChat,
-        amount: safeAmount,
-        audioUrl,
-    };
-
-    socket.emit('chat', {
-        username: safeUsername,
-        comment: safeComment,
-        isSuperChat: !!isSuperChat,
-        amount: safeAmount,
-        audioData: audioBase64 ? `data:audio/mp3;base64,${audioBase64}` : null,
-        audioUrl,
-    });
-
-    if (videoId) {
-        broadcastToWsClients(chatPayload, videoId);
-    }
-}
-
 // ─── Socket.IO ────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
     logIoConnection('CONNECTED', socket.id);
 
-    /** @type {import('masterchat').Masterchat | null} */
-    let mc = null;
-
-    const stopListening = () => {
-        if (mc) {
-            const currentMc = mc;
-            mc = null;
-            try {
-                currentMc.removeAllListeners();
-                currentMc.stop();
-            } catch (e) {
-                // Abaikan error saat stop
-            }
-            console.log(`[INFO] Masterchat dihentikan untuk ${socket.id}`);
-        }
-    };
+    let currentStreamKey = null;
 
     socket.on('set-video', async (input) => {
-        // FIX: Validasi tipe input secara ketat
         if (!input || (typeof input !== 'string' && (typeof input !== 'object' || Array.isArray(input)))) {
             socket.emit('sys-message', '❌ Input tidak valid.');
             return;
         }
-        stopListening();
 
         let videoIdRaw = input;
         let customLang = TTS_LANG;
@@ -608,7 +608,6 @@ io.on('connection', (socket) => {
 
         if (typeof input === 'object' && input !== null) {
             videoIdRaw = input.videoId || input.url;
-            // FIX: Validasi lang dan maxLength dari object input
             if (input.lang) customLang = validateLang(input.lang);
             if (input.maxLength) customMaxLength = validateMaxLength(input.maxLength);
         }
@@ -621,78 +620,44 @@ io.on('connection', (socket) => {
         }
 
         console.log(`[INFO] Memantau video: ${videoId}`);
-        socket.emit('sys-message', `⏳ Menghubungkan ke live stream...`);
+        
+        if (currentStreamKey) {
+            removeIoClient(socket, currentStreamKey);
+            stopLiveSessionIfEmpty(currentStreamKey);
+        }
 
-        try {
-            mc = new Masterchat(videoId, '', { mode: 'live' });
-
-            await mc.populateMetadata();
-            // FIX: Sanitasi title dari YouTube sebelum di-log/emit
-            const title = sanitizeString(mc.title || videoId, 200);
-            console.log(`[BERHASIL] Terhubung ke: "${title}" (${videoId})`);
-            socket.emit('sys-message', `✅ Terhubung! Memantau: ${title}`);
-
-            mc.on('chat', async (action) => {
-                if (action.type !== 'addChatItemAction') return;
-                // FIX: Sanitasi username dari YouTube
-                const username = sanitizeString(
-                    (action.authorName || 'Anonim').replace(/^@/, ''),
-                    MAX_USERNAME_LENGTH
-                );
-                const comment = action.message ? sanitizeString(runsToString(action.message), MAX_COMMENT_LENGTH) : '';
-                if (!comment) return;
-                await handleChatEvent(socket, { username, comment, isSuperChat: false, lang: customLang, maxLength: customMaxLength, videoId });
-            });
-
-            mc.on('actions', async (actions) => {
-                for (const action of actions) {
-                    if (action.type === 'addSuperChatItemAction') {
-                        const username = sanitizeString(
-                            (action.authorName || 'Anonim').replace(/^@/, ''),
-                            MAX_USERNAME_LENGTH
-                        );
-                        const comment = action.message ? sanitizeString(runsToString(action.message), MAX_COMMENT_LENGTH) : '';
-                        const amount = action.superchat?.amount
-                            ? sanitizeString(`${action.superchat.currency} ${action.superchat.amount}`, 50)
-                            : null;
-                        await handleChatEvent(socket, { username, comment, isSuperChat: true, amount, lang: customLang, maxLength: customMaxLength, videoId });
-                    }
-                }
-            });
-
-            mc.on('end', (reason) => {
-                const safeReason = reason ? sanitizeString(String(reason), 100) : '';
-                console.log(`[INFO] Live berakhir: ${safeReason}`);
-                socket.emit('sys-message', `⚠️ Live berakhir${safeReason ? ': ' + safeReason : '.'}`);
-                stopListening();
-            });
-
-            mc.on('error', (err) => {
-                const safeMsg = sanitizeString(err.message, 200);
-                console.error(`[ERROR] Masterchat:`, safeMsg);
-                socket.emit('sys-message', `❌ Error: ${safeMsg}`);
-                socket.emit('sys-error', safeMsg);
-            });
-
-            mc.listen();
-
-        } catch (err) {
-            const safeMsg = sanitizeString(err.message, 200);
-            console.error(`[GAGAL] ${safeMsg}`);
-            socket.emit('sys-message', `❌ Gagal: ${safeMsg}`);
-            socket.emit('sys-error', safeMsg);
-            mc = null;
+        currentStreamKey = videoId;
+        addIoClient(socket, currentStreamKey, customLang, customMaxLength);
+        
+        const isNewSession = !liveSessionMap.has(currentStreamKey);
+        startLiveSession(currentStreamKey);
+        
+        if (!isNewSession) {
+            const session = liveSessionMap.get(currentStreamKey);
+            if (session && session.status === 'connected') {
+                socket.emit('sys-message', `✅ Terhubung! Memantau: ${currentStreamKey}`);
+            } else if (session && session.status === 'connecting') {
+                socket.emit('sys-message', `⏳ Menghubungkan ke live stream...`);
+            }
         }
     });
 
     socket.on('stop', () => {
-        stopListening();
+        if (currentStreamKey) {
+            removeIoClient(socket, currentStreamKey);
+            stopLiveSessionIfEmpty(currentStreamKey);
+            currentStreamKey = null;
+        }
         socket.emit('sys-message', '⏹️ Pemantauan dihentikan.');
     });
 
     socket.on('disconnect', () => {
-        logIoConnection('DISCONNECTED', socket.id);
-        stopListening();
+        logIoConnection('DISCONNECTED', socket.id, currentStreamKey);
+        if (currentStreamKey) {
+            removeIoClient(socket, currentStreamKey);
+            stopLiveSessionIfEmpty(currentStreamKey);
+            currentStreamKey = null;
+        }
     });
 });
 
